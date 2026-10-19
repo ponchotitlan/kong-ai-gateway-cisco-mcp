@@ -1,0 +1,129 @@
+name: kong-workshop
+
+# Kong AI Gateway in front of the pyATS MCP server, with Keycloak deciding
+# who the caller is and the AI Gateway deciding which MCP tools they may use.
+#
+#   MCP client --Bearer JWT--> kong-ai-dp :8010/pyats-tools --> pyats-mcp:8000/mcp
+#                                   |
+#                                   +-- validates the token against keycloak (realm "kong")
+
+networks:
+  workshop:
+    name: kong-workshop
+
+volumes:
+  keycloak-db-data:
+
+services:
+  # ---------------------------------------------------------------------
+  # Postgres - Keycloak's database
+  # ---------------------------------------------------------------------
+  postgres:
+    image: mirror.gcr.io/postgres:17
+    container_name: postgres
+    hostname: postgres
+    networks:
+      - workshop
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+      POSTGRES_DB: keycloak
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Keycloak - identity provider. Issues the tokens whose mcp_role claim
+  # selects the AI Consumer (netops-admin / netops-viewer) in Kong.
+  # ---------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.5
+    container_name: keycloak
+    hostname: keycloak
+    command: ["start"]
+    networks:
+      - workshop
+    depends_on:
+      - postgres
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      # Pin the token issuer to the host-facing URL so tokens fetched from the
+      # laptop (localhost:8080) validate in Kong, which reaches Keycloak as
+      # keycloak:8080. Backchannel endpoints (jwks_uri, token, introspection)
+      # stay dynamic, so containers still get keycloak:8080 URLs in discovery.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_DB: postgres
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_URL_HOST: postgres
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KC_LOG_LEVEL: INFO
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # pyATS MCP server - upstream of the "pyats-tools" MCP server in the AI
+  # Gateway (passthrough listener on /pyats-tools ->
+  # http://pyats-mcp:8000/mcp). Image built from ~/Documents/pyATS_MCP
+  # (`docker compose build` there). Deliberately not published on the host
+  # so clients can't bypass Kong's auth/ACLs - go through kong-ai-dp on :8010.
+  # ---------------------------------------------------------------------
+  pyats-mcp:
+    image: pyats-mcp:latest
+    container_name: pyats-mcp
+    hostname: pyats-mcp
+    networks:
+      - workshop
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      PYATS_TESTBED_PATH: /app/testbed.yaml
+      PYATS_MCP_ARTIFACTS_DIR: /app/artifacts
+    volumes:
+      - ${PYATS_TESTBED_FILE:-../pyATS_MCP/testbed.yaml}:/app/testbed.yaml:ro
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Kong AI Gateway Data Plane - attaches to the AI Gateway created by
+  # konnect/create-ai-gateway.sh, which writes the AI_KONNECT_* values and
+  # the certificate this service uses.
+  # ---------------------------------------------------------------------
+  kong-ai-dp:
+    image: kong/kong-ai-gateway:2.0.3
+    container_name: kong-ai-dp
+    hostname: kong-ai-dp
+    networks:
+      - workshop
+    environment:
+      KONG_ROLE: data_plane
+      KONG_DATABASE: "off"
+      KONG_VITALS: "off"
+      KONG_CLUSTER_MTLS: pki
+      KONG_CLUSTER_CONTROL_PLANE: ${AI_KONNECT_CLUSTER_CONTROL_PLANE}
+      KONG_CLUSTER_SERVER_NAME: ${AI_KONNECT_CLUSTER_SERVER_NAME}
+      KONG_CLUSTER_TELEMETRY_ENDPOINT: ${AI_KONNECT_CLUSTER_TELEMETRY_ENDPOINT}
+      KONG_CLUSTER_TELEMETRY_SERVER_NAME: ${AI_KONNECT_CLUSTER_TELEMETRY_SERVER_NAME}
+      KONG_CLUSTER_CERT: /etc/kong/certs/tls.crt
+      KONG_CLUSTER_CERT_KEY: /etc/kong/certs/tls.key
+      # Trust the corporate TLS-inspecting proxy's root CA for outbound HTTPS.
+      KONG_LUA_SSL_TRUSTED_CERTIFICATE: "system,/etc/kong/ca/corporate-ca.pem"
+      KONG_LUA_SSL_VERIFY_DEPTH: "5"
+      KONG_KONNECT_MODE: "on"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000, 0.0.0.0:8443 ssl"
+      KONG_ADMIN_LISTEN: "off"
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+    volumes:
+      - ./certs/kong-ai:/etc/kong/certs:ro
+      - ./cisco-ca.pem:/etc/kong/ca/corporate-ca.pem:ro
+    ports:
+      - "8010:8000"
+      - "8453:8443"
+      - "8110:8100"
+    restart: unless-stopped

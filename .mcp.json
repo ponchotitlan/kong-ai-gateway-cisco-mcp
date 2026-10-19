@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pyats": {
+      "type": "http",
+      "url": "http://localhost:8010/pyats-tools",
+      "headersHelper": "./keycloak/mcp-auth.sh headers"
+    }
+  }
+}

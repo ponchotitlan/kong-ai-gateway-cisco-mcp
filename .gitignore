@@ -1,0 +1,6 @@
+.env
+certs/kong/
+certs/kong-ai/
+certs/*.crt
+certs/*.pem
+*.pem
