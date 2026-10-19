@@ -36,22 +36,26 @@ find_by_name() {
 }
 
 echo "Auth strategy 'keycloak-kong'..."
-if [ -z "$(find_by_name auth-strategies keycloak-kong)" ]; then
-  curl -s -X POST "$API/auth-strategies" "${auth[@]}" -d "$(jq -n --arg issuer "$OIDC_ISSUER" '{
-    name: "keycloak-kong",
-    display_name: "Keycloak (kong realm)",
-    type: "openid-connect",
-    config: {
-      issuer: $issuer,
-      auth_methods: ["bearer"],
-      cache_tokens_salt: "keycloak-kong-mcp",
-      consumer_claims: [["mcp_role"]],
-      consumer_by: ["username"],
-      consumer_optional: false
-    }
-  }')" | jq -c '{id, name}'
+STRATEGY=$(jq -n --arg issuer "$OIDC_ISSUER" '{
+  name: "keycloak-kong",
+  display_name: "Keycloak (kong realm)",
+  type: "openid-connect",
+  config: {
+    issuer: $issuer,
+    auth_methods: ["bearer"],
+    cache_tokens_salt: "keycloak-kong-mcp",
+    consumer_claims: [["mcp_role"]],
+    consumer_by: ["username"],
+    consumer_optional: false,
+    upstream_headers_claims: ["preferred_username"],
+    upstream_headers_names: ["X-Authenticated-User"]
+  }
+}')
+STRATEGY_ID=$(find_by_name auth-strategies keycloak-kong)
+if [ -z "$STRATEGY_ID" ]; then
+  curl -s -X POST "$API/auth-strategies" "${auth[@]}" -d "$STRATEGY" | jq -c '{id, name}'
 else
-  echo "  already exists"
+  curl -s -X PUT "$API/auth-strategies/$STRATEGY_ID" "${auth[@]}" -d "$STRATEGY" | jq -c '{id, name, message}'
 fi
 
 for role in netops-admin netops-viewer; do

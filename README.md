@@ -1,5 +1,16 @@
 # Kong AI Gateway: Keycloak auth and MCP tool authorization
 
+[![Kong AI Gateway](https://img.shields.io/badge/Kong_AI_Gateway-2.0.3-003459?style=flat&logo=kong&logoColor=white)](https://konghq.com/products/kong-ai-gateway)
+[![Kong Konnect](https://img.shields.io/badge/Kong_Konnect-cloud-003459?style=flat&logo=kong&logoColor=white)](https://cloud.konghq.com)
+[![Keycloak](https://img.shields.io/badge/Keycloak-26.4.5-4D4D4D?style=flat&logo=keycloak&logoColor=white)](https://www.keycloak.org)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?style=flat&logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Docker Compose](https://img.shields.io/badge/Docker_Compose-2496ED?style=flat&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+[![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-000000?style=flat&logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
+[![pyATS](https://img.shields.io/badge/Cisco_pyATS-MCP_server-049FD9?style=flat&logo=cisco&logoColor=white)](https://github.com/ponchotitlan/pyATS_MCP)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-D97757?style=flat&logo=claude&logoColor=white)](https://claude.com/claude-code)
+[![OpenID Connect](https://img.shields.io/badge/OpenID_Connect-F78C40?style=flat&logo=openid&logoColor=white)](https://openid.net/connect/)
+[![Bash](https://img.shields.io/badge/Bash-4EAA25?style=flat&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+
 Puts the [pyATS MCP server](https://github.com/ponchotitlan/pyATS_MCP) behind
 Kong AI Gateway. Keycloak decides who the caller is; the AI Gateway decides
 which MCP tools they may see and call.
@@ -197,7 +208,13 @@ the access rules to the ones below.
 2. **Auth strategy `keycloak-kong`** (`openid-connect`): validates the bearer
    token against `http://keycloak:8080/realms/kong` and maps its `mcp_role`
    claim to the AI Consumer with that name (`consumer_claims: [["mcp_role"]]`,
-   `consumer_by: username`, `consumer_optional: false`).
+   `consumer_by: username`, `consumer_optional: false`). It also copies the
+   token's `preferred_username` into an `X-Authenticated-User` header on every
+   request it forwards to pyATS (`upstream_headers_claims` /
+   `upstream_headers_names`), so the MCP server knows which user made each
+   tool call, not just their role. Kong replaces any `X-Authenticated-User`
+   header the client sends with the value from the token, so it can't be
+   faked.
 3. **AI Consumers `netops-admin` and `netops-viewer`**: one per role.
 4. **Access rules on `pyats-tools`**:
    ```yaml
@@ -345,7 +362,8 @@ rejected that with "access token claims not available"; it seems to need
 the `access.metadata` OAuth setup. Mapping `mcp_role` to one AI Consumer per
 role keeps Keycloak as the only place that assigns roles, with just two
 objects in Kong. The trade-off: Konnect's analytics and logs show the role,
-not the individual user.
+not the individual user. The user still reaches pyATS in the
+`X-Authenticated-User` header (see step 3).
 
 ## Debugging pyats-mcp directly
 
