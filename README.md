@@ -11,9 +11,106 @@
 [![OpenID Connect](https://img.shields.io/badge/OpenID_Connect-F78C40?style=flat&logo=openid&logoColor=white)](https://openid.net/connect/)
 [![Bash](https://img.shields.io/badge/Bash-4EAA25?style=flat&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 
-Puts the [pyATS MCP server](https://github.com/ponchotitlan/pyATS_MCP) behind
-Kong AI Gateway. Keycloak decides who the caller is; the AI Gateway decides
-which MCP tools they may see and call.
+A proof of concept for running AI-driven network operations safely: Kong AI
+Gateway sits between AI assistants and Cisco MCP servers and decides **who**
+may use **which tools**, and records **what they did**. The first use case
+is the [pyATS MCP server](https://github.com/ponchotitlan/pyATS_MCP).
+
+- [Why this PoC](#why-this-poc)
+- [General architecture](#general-architecture)
+- [Use case: the pyATS MCP server](#use-case-the-pyats-mcp-server)
+- [Run it yourself](#run-it-yourself)
+- [How the observability stack works](#how-the-observability-stack-works)
+- [Reference](#reference)
+
+## Why this PoC
+
+AI assistants such as Claude Code can now operate a network through **MCP
+servers**. An MCP server exposes tools like "run a show command" or
+"configure a device", and the model decides when to call them. That's
+powerful, and it raises the questions every NetOps team asks about any
+access to its devices:
+
+| Question | Without a gateway | With Kong AI Gateway |
+|---|---|---|
+| **Who is calling?** | The MCP server usually doesn't know | Every request carries a token from the corporate identity provider |
+| **What may they do?** | Every client sees every tool, including config changes | Each role sees and can call only its tools; the rest are blocked before they reach the server |
+| **What happened?** | Scattered, per-server logs, if any | One record per tool call: when, who, which tool, arguments, reply, allowed or denied |
+
+The goal of this PoC is to show that these controls can live **in the
+gateway, not in each MCP server**. The MCP servers stay unchanged, users and
+roles stay in the identity provider, and adding another MCP server means
+reusing the same login, the same kind of rules and the same dashboards.
+
+## General architecture
+
+```mermaid
+flowchart LR
+    clients["🤖 <b>AI clients</b><br/>Claude Code · agents · CLI"]
+    idp["🔑 <b>Identity provider</b><br/>Keycloak<br/><i>users and roles</i>"]
+
+    subgraph gw["Kong AI Gateway"]
+        direction TB
+        cp["☁️ <b>Control plane</b><br/>Kong Konnect<br/><i>configuration</i>"]
+        dp["🛡️ <b>Data plane</b><br/>authenticate → authorize tool → log"]
+        cp -- "config push" --> dp
+    end
+
+    subgraph servers["Cisco MCP servers"]
+        direction TB
+        pyats["pyATS MCP"]
+        more["more MCP servers<br/><i>future use cases</i>"]
+    end
+
+    net["🌐 <b>Network</b><br/>devices and platforms"]
+    obs["📊 <b>Observability</b><br/>Vector · Loki · Grafana"]
+
+    clients -. "① log in" .-> idp
+    clients -- "② MCP request + token" --> dp
+    dp -. "verify token" .-> idp
+    dp -- "③ allowed calls only" --> servers
+    servers --> net
+    dp -- "④ one record per call" --> obs
+```
+
+Every MCP request goes through the same four steps:
+
+1. **Log in.** The user signs in to the identity provider and gets a token
+   that names them and carries their role.
+2. **Authenticate.** The gateway's data plane checks the token on every
+   request. No valid token, no access.
+3. **Authorize per tool.** The gateway maps the role to a set of allowed
+   tools. It hides the other tools from the tool list and blocks calls to
+   them, so they never reach the MCP server.
+4. **Observe.** The gateway logs every call (who, tool, decision, request
+   and reply) to the observability stack.
+
+| Building block | Role | In this PoC |
+|---|---|---|
+| Identity provider | Owns users and roles, issues tokens | Keycloak (OpenID Connect) |
+| Gateway control plane | Holds the configuration: MCP servers, login settings, roles, tool rules, log policies | Kong Konnect (cloud) |
+| Gateway data plane | The only way in: enforces that configuration on every request | Kong AI Gateway container |
+| MCP servers | Expose the actual tools; unchanged | pyATS MCP server |
+| Observability | Collects, stores and shows the gateway's logs | Vector → Loki → Grafana |
+
+The control plane and data plane are split: you configure in Konnect (UI or
+API), and the data plane runs next to the MCP servers and receives that
+configuration over mTLS. MCP traffic and its logs never pass through
+Konnect.
+
+## Use case: the pyATS MCP server
+
+### The scenario
+
+[Cisco pyATS](https://developer.cisco.com/pyats/) is Cisco's network test
+and automation framework. The
+[pyATS MCP server](https://github.com/ponchotitlan/pyATS_MCP) turns it into
+nine MCP tools, from read-only ones like `show` commands to ones that change
+the network, like pushing configuration.
+
+A NetOps team has two kinds of people: **viewers**, who troubleshoot, and
+**admins**, who may also change things. The gateway gives each role only
+its tools:
 
 | Role (`mcp_role` claim) | Keycloak user        | Tools                                                                                                                              |
 |-------------------------|----------------------|------------------------------------------------------------------------------------------------------------------------------------|
@@ -21,9 +118,10 @@ which MCP tools they may see and call.
 | `netops-admin`          | `netops-admin-user`  | all of the above, plus `pyats_configure_device`, `pyats_run_linux_command`, `pyats_run_dynamic_test`, `pyats_load_external_inventory` |
 
 Both users' password is `kong`. No token gets a 401; a valid token without a
-known `mcp_role` gets a 403.
+known `mcp_role` gets a 403. As a viewer, Claude Code doesn't even see the
+config tools, so asking it to change the network simply isn't possible.
 
-## Architecture
+### Deployment
 
 ```mermaid
 flowchart LR
@@ -67,7 +165,92 @@ flowchart LR
 - **`pyats-mcp`** isn't published on the host, so it can't be called
   without going through Kong.
 
-## Authentication and authorization flow
+### How it's implemented
+
+#### 1. Identity: Keycloak
+
+[keycloak/setup.sh](keycloak/setup.sh) creates:
+
+- the **`kong` realm**, which holds the users;
+- the public **`mcp-client`** client, which MCP clients use to log in;
+- a mapper that copies each user's `mcp_role` attribute into an **`mcp_role`
+  claim** in their access token;
+- the two users, `netops-viewer-user` and `netops-admin-user`.
+
+Roles live only in Keycloak. To give someone access, create them in the
+`kong` realm with an `mcp_role` attribute of `netops-admin` or
+`netops-viewer`. Nothing changes in Kong.
+
+#### 2. Authentication and tool rules: Kong AI Gateway
+
+[konnect/create-mcp-acl.sh](konnect/create-mcp-acl.sh) configures the AI
+Gateway in Konnect. It's safe to re-run, and resets the access rules to the
+ones below.
+
+1. **MCP server `pyats-tools`**, created if missing: a passthrough listener
+   on `/pyats-tools` forwarding to `http://pyats-mcp:8000/mcp`.
+2. **Auth strategy `keycloak-kong`** (`openid-connect`): validates the bearer
+   token against `http://keycloak:8080/realms/kong` and maps its `mcp_role`
+   claim to the AI Consumer with that name (`consumer_claims: [["mcp_role"]]`,
+   `consumer_by: username`, `consumer_optional: false`). It also copies the
+   token's `preferred_username` into an `X-Authenticated-User` header on every
+   request it forwards to pyATS (`upstream_headers_claims` /
+   `upstream_headers_names`), so the MCP server knows which user made each
+   tool call, not just their role. Kong replaces any `X-Authenticated-User`
+   header the client sends with the value from the token, so it can't be
+   faked.
+3. **AI Consumers `netops-admin` and `netops-viewer`**: one per role.
+4. **Access rules on `pyats-tools`**:
+   ```yaml
+   access:
+     auth_strategies: [keycloak-kong]
+     acl_attribute_type: consumer
+     acls:              { allow: [netops-admin, netops-viewer] }   # who may connect
+     default_tool_acls: { allow: [netops-admin, netops-viewer] }   # tools without their own rule
+   tools:                                                           # replace the default per tool
+     - { name: pyats_configure_device,        access: { acls: { allow: [netops-admin] } } }
+     - { name: pyats_run_linux_command,       access: { acls: { allow: [netops-admin] } } }
+     - { name: pyats_run_dynamic_test,        access: { acls: { allow: [netops-admin] } } }
+     - { name: pyats_load_external_inventory, access: { acls: { allow: [netops-admin] } } }
+   ```
+
+To see it in the Konnect UI, go to **AI Gateway → ai_gateway_1**:
+
+| Object | Where |
+|---|---|
+| Auth strategy | **Auth Strategies → Keycloak (kong realm)** |
+| Consumers | **Consumers** → `netops-admin`, `netops-viewer` |
+| Access rules | **MCP servers → pyATS Tools** → **ACLs** (attribute type, **Default tool ACL**) and **Tools** |
+
+`pyats-tools` is a passthrough listener, so Konnect never stores the pyATS
+tool list: **Tools** shows only the four tools with their own rule, and every
+other tool falls under the default tool ACL. Tool names aren't checked
+against the server, so a typo silently leaves that tool open to viewers.
+
+#### 3. Connecting Claude Code
+
+Users log in once with [keycloak/mcp-auth.sh](keycloak/mcp-auth.sh), and
+Claude Code fetches a fresh token from it whenever it connects.
+
+`./keycloak/mcp-auth.sh login` exchanges your password for an offline refresh
+token and stores only that token in `~/.config/pyats-mcp/session` (mode
+600), never the password. The `pyats` entry in [.mcp.json](.mcp.json) runs
+`./keycloak/mcp-auth.sh headers` as its `headersHelper` on every connect,
+trading the stored token for a fresh access token. If a call gets a 401 or
+403, Claude Code runs the helper again and retries once. Claude Code runs
+the helper without a terminal, so it can't prompt you; that's why `login` is
+a separate step.
+
+#### 4. Observability
+
+[konnect/create-mcp-observability.sh](konnect/create-mcp-observability.sh)
+attaches an `http-log` policy to `pyats-tools`, so the data plane sends a log
+record for every MCP request to Vector. Vector turns each record into one
+event per MCP call (who, role, tool, decision, request, reply) and stores it
+in Loki, and a Grafana dashboard shows it. See
+[How the observability stack works](#how-the-observability-stack-works).
+
+### Request flow
 
 ```mermaid
 sequenceDiagram
@@ -110,21 +293,36 @@ sequenceDiagram
 
 Every allow/deny decision is written to the AI Gateway's audit log.
 
-## What's in here
+### Design notes
 
-| Path | Purpose |
-|---|---|
-| [docker-compose.yml](docker-compose.yml) | `kong-ai-dp`, `keycloak` + `postgres`, `pyats-mcp`; `vector`, `loki`, `grafana` in the `observability` profile |
-| [konnect/create-ai-gateway.sh](konnect/create-ai-gateway.sh) | Creates the AI Gateway in Konnect, the data plane certificate and the `AI_*` values in `.env` |
-| [konnect/create-mcp-acl.sh](konnect/create-mcp-acl.sh) | Creates the `pyats-tools` MCP server, the `keycloak-kong` auth strategy, the two AI Consumers and the access rules |
-| [konnect/create-mcp-observability.sh](konnect/create-mcp-observability.sh) | Creates the `mcp-http-log` policy and attaches it to `pyats-tools` (`remove` undoes it) |
-| [observability/](observability/) | Vector pipeline, Grafana data source and the MCP dashboard |
-| [keycloak/setup.sh](keycloak/setup.sh) | Creates the `kong` realm, `mcp-client`, the `mcp_role` claim and the two users |
-| [keycloak/mcp-auth.sh](keycloak/mcp-auth.sh) | `login` / `status` / `logout`, and the `headers` helper Claude Code runs |
-| [keycloak/test-mcp-acl.sh](keycloak/test-mcp-acl.sh) | Checks the rules through Kong as each user |
-| [.mcp.json](.mcp.json), [.claude/settings.json](.claude/settings.json) | The `pyats` server for Claude Code, pre-approved |
+#### Why consumers instead of matching the claim directly
 
-## Prerequisites
+The MCP server can match rules against a token claim directly
+(`acl_attribute_type: oauth_access_token`). With this setup the gateway
+rejected that with "access token claims not available"; it seems to need
+the `access.metadata` OAuth setup. Mapping `mcp_role` to one AI Consumer per
+role keeps Keycloak as the only place that assigns roles, with just two
+objects in Kong. The trade-off: Konnect's analytics and logs show the role,
+not the individual user. The user still reaches pyATS in the
+`X-Authenticated-User` header (see [Authentication and tool rules](#2-authentication-and-tool-rules-kong-ai-gateway)).
+
+#### Keycloak issuer
+
+`KC_HOSTNAME=http://localhost:8080` pins the token issuer to the host-facing
+URL, so a token fetched from the laptop validates in Kong, which reaches
+Keycloak as `keycloak:8080`. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` keeps
+`jwks_uri` / `token_endpoint` on whatever host was used:
+
+```bash
+docker run --rm --network kong-workshop curlimages/curl -s \
+  http://keycloak:8080/realms/kong/.well-known/openid-configuration | jq '{issuer, jwks_uri}'
+# issuer   => http://localhost:8080/realms/kong
+# jwks_uri => http://keycloak:8080/realms/kong/protocol/openid-connect/certs
+```
+
+## Run it yourself
+
+### Prerequisites
 
 - Docker, `jq` and `curl`
 - A Konnect account and a [Personal Access Token](https://cloud.konghq.com/global/account/tokens)
@@ -135,7 +333,7 @@ Every allow/deny decision is written to the AI Gateway's audit log.
   trusts for outbound HTTPS. It's git-ignored, so copy it in yourself. Off
   the corporate network, any valid PEM certificate will do.
 
-## Step 1: Create the AI Gateway
+### Step 1: Create the AI Gateway
 
 1. Put your token in `.env` (see [.env.example](.env.example)):
    ```bash
@@ -165,13 +363,7 @@ Every allow/deny decision is written to the AI Gateway's audit log.
      -H "Authorization: Bearer $PAT" | jq '.data[] | {hostname, version}'
    ```
 
-| Port | Service |
-|---|---|
-| 8010 / 8453 | AI Gateway proxy (http / https) |
-| 8110 | AI Gateway status |
-| 8080 | Keycloak (admin / admin) |
-
-## Step 2: Set up the Keycloak users
+### Step 2: Set up the Keycloak users
 
 1. Wait for Keycloak to answer on `http://localhost:8080`, then:
    ```bash
@@ -196,42 +388,15 @@ Every allow/deny decision is written to the AI Gateway's audit log.
 To add a user, create them in the **kong** realm with an `mcp_role`
 attribute of `netops-admin` or `netops-viewer`. Nothing changes in Kong.
 
-## Step 3: Protect the MCP server
+### Step 3: Protect the MCP server
 
 ```bash
 ./konnect/create-mcp-acl.sh
 ```
 
-This configures the AI Gateway in Konnect. It's safe to re-run, and resets
-the access rules to the ones below.
-
-1. **MCP server `pyats-tools`**, created if missing: a passthrough listener
-   on `/pyats-tools` forwarding to `http://pyats-mcp:8000/mcp`.
-2. **Auth strategy `keycloak-kong`** (`openid-connect`): validates the bearer
-   token against `http://keycloak:8080/realms/kong` and maps its `mcp_role`
-   claim to the AI Consumer with that name (`consumer_claims: [["mcp_role"]]`,
-   `consumer_by: username`, `consumer_optional: false`). It also copies the
-   token's `preferred_username` into an `X-Authenticated-User` header on every
-   request it forwards to pyATS (`upstream_headers_claims` /
-   `upstream_headers_names`), so the MCP server knows which user made each
-   tool call, not just their role. Kong replaces any `X-Authenticated-User`
-   header the client sends with the value from the token, so it can't be
-   faked.
-3. **AI Consumers `netops-admin` and `netops-viewer`**: one per role.
-4. **Access rules on `pyats-tools`**:
-   ```yaml
-   access:
-     auth_strategies: [keycloak-kong]
-     acl_attribute_type: consumer
-     acls:              { allow: [netops-admin, netops-viewer] }   # who may connect
-     default_tool_acls: { allow: [netops-admin, netops-viewer] }   # tools without their own rule
-   tools:                                                           # replace the default per tool
-     - { name: pyats_configure_device,        access: { acls: { allow: [netops-admin] } } }
-     - { name: pyats_run_linux_command,       access: { acls: { allow: [netops-admin] } } }
-     - { name: pyats_run_dynamic_test,        access: { acls: { allow: [netops-admin] } } }
-     - { name: pyats_load_external_inventory, access: { acls: { allow: [netops-admin] } } }
-   ```
-
+This creates the MCP server, the Keycloak auth strategy, the two AI
+Consumers and the tool rules described in
+[Authentication and tool rules](#2-authentication-and-tool-rules-kong-ai-gateway).
 Then check all the cases at once:
 
 ```bash
@@ -241,22 +406,7 @@ Then check all the cases at once:
 Expected: no token → 401; the viewer sees 5 tools and gets 403 on
 `pyats_configure_device`; the admin sees all 9.
 
-### Where to find it in the Konnect UI
-
-Under **AI Gateway → ai_gateway_1**:
-
-| Object | Where |
-|---|---|
-| Auth strategy | **Auth Strategies → Keycloak (kong realm)** |
-| Consumers | **Consumers** → `netops-admin`, `netops-viewer` |
-| Access rules | **MCP servers → pyATS Tools** → **ACLs** (attribute type, **Default tool ACL**) and **Tools** |
-
-`pyats-tools` is a passthrough listener, so Konnect never stores the pyATS
-tool list: **Tools** shows only the four tools with their own rule, and every
-other tool falls under the default tool ACL. Tool names aren't checked
-against the server, so a typo silently leaves that tool open to viewers.
-
-## Step 4a: Use it from the CLI
+### Step 4a: Use it from the CLI
 
 Every request needs `Authorization: Bearer <access token>`. MCP over HTTP is
 a session: `initialize`, then `notifications/initialized`, then any number of
@@ -303,7 +453,7 @@ requests carrying the `Mcp-Session-Id` header the server returned.
 The same commands work in bash and zsh. Repeat with
 `username=netops-admin-user` to see all 9 tools.
 
-## Step 4b: Use it from Claude Code
+### Step 4b: Use it from Claude Code
 
 1. Log in once in a terminal, with any user from the **kong** realm:
    ```bash
@@ -323,15 +473,6 @@ The same commands work in bash and zsh. Repeat with
    ./keycloak/mcp-auth.sh logout    # revokes the session in Keycloak and deletes it locally
    ```
 
-**How it works:** `login` exchanges your password for an offline refresh
-token and stores only that token in `~/.config/pyats-mcp/session` (mode
-600), never the password. The `pyats` entry in [.mcp.json](.mcp.json) runs
-`./keycloak/mcp-auth.sh headers` as its `headersHelper` on every connect,
-trading the stored token for a fresh access token. If a call gets a 401 or
-403, Claude Code runs the helper again and retries once. Claude Code runs
-the helper without a terminal, so it can't prompt you; that's why `login` is
-a separate step.
-
 **If `/mcp` shows the server as failed:**
 - `./keycloak/mcp-auth.sh status` says "not logged in" or "session expired":
   run `login` again.
@@ -342,7 +483,10 @@ a separate step.
 - `claude mcp get pyats` says *Rejected*: remove `pyats` from
   `disabledMcpjsonServers` in your `.claude/settings.local.json`.
 
-## Step 5 (optional): Observe MCP tool use in Grafana
+How the login and token refresh work is described in
+[Connecting Claude Code](#3-connecting-claude-code).
+
+### Step 5 (optional): Observe MCP tool use in Grafana
 
 The `observability` compose profile adds Vector, Loki and Grafana. An
 `http-log` policy on `pyats-tools` makes the AI Gateway POST a log record
@@ -559,6 +703,229 @@ flowchart LR
     dash["observability/grafana/dashboards/<br/>mcp-tools.json"] -- "the dashboard" --> gf
 ```
 
+### One tool call, four shapes
+
+Follow one real call, `netops-viewer-user` running `show clock` on R1, as
+it moves through the pipeline. The data changes shape at every step:
+
+```mermaid
+flowchart LR
+    s1["<b>① Kong → Vector</b><br/>one big nested JSON record<br/>per HTTP request"]
+    s2["<b>② Vector → Loki</b><br/>one flat JSON event<br/>per MCP call"]
+    s3["<b>③ Inside Loki</b><br/>labels + timestamp<br/>+ log line"]
+    s4["<b>④ In Grafana</b><br/>rows with Time, Line<br/>and labels / fields"]
+    s1 -- "VRL transform<br/>picks + renames" --> s2
+    s2 -- "loki sink splits<br/>labels from line" --> s3
+    s3 -- "LogQL query via the<br/>Loki data source" --> s4
+```
+
+The log records don't pass through Konnect. The local data plane,
+`kong-ai-dp`, sends them straight to Vector. Konnect only holds the
+`mcp-http-log` policy that tells the data plane where to send them.
+
+#### ① What Kong sends to Vector
+
+The `http-log` policy POSTs one JSON record per HTTP request to
+`http://vector:9880/kong`. It's Kong's standard log record (request,
+response, latencies, consumer, route, service) plus an `ai.mcp` section the
+AI Gateway adds for MCP traffic. Abridged; `◀` marks what Vector uses:
+
+```jsonc
+{
+  "started_at": 1792420132861,                       // ◀ when (ms since epoch)
+  "client_ip": "192.168.65.1",                       // ◀
+  "consumer": { "username": "netops-viewer", "id": "c4329c63-…" },   // ◀ role
+  "request": {
+    "method": "POST", "uri": "/pyats-tools", "size": 1788,
+    "headers": {
+      "authorization": "REDACTED",                   // Kong never logs the token
+      "x-authenticated-user": "netops-viewer-user",  // ◀ who
+      "x-consumer-username": "netops-viewer",
+      "mcp-session-id": "730c63ba3c864d7d8dc447b91bb3c50a",
+      "user-agent": "curl/8.7.1"
+    }
+  },
+  "response": {
+    "status": 200,                                   // ◀
+    "headers": { "x-kong-request-id": "4c351702abff7c630e74a644c17ea369", … }  // ◀
+  },
+  "latencies": { "request": 14127, "proxy": 3, "kong": 2, … },
+  "route": { "name": "pyats-tools-route", … },
+  "service": { "name": "pyats-tools", "host": "pyats-mcp", "port": 8000, … },
+  "ai": {
+    "mcp": {
+      "mcp_session_id": "730c63ba3c864d7d8dc447b91bb3c50a",           // ◀
+      "audit": [                                     // ◀ the ACL decision
+        { "action": "allow", "primitive": "tool",
+          "primitive_name": "pyats_run_show_command",
+          "consumer": { "name": "netops-viewer", … } }
+      ],
+      "rpc": [                                       // ◀ one entry per JSON-RPC call
+        {
+          "id": "3", "method": "tools/call",
+          "tool_name": "pyats_run_show_command",
+          "latency": 14126, "response_body_size": 415,
+          "payload": {                               // because the MCP server has logging.payloads on
+            "request":  "{\"method\":\"tools/call\",\"id\":3,\"params\":{\"arguments\":{\"device_name\":\"R1\",\"command\":\"show clock\"},\"name\":\"pyats_run_show_command\"},\"jsonrpc\":\"2.0\"}",
+            "response": "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\n  \\\"status\\\": \\\"completed\\\", … \\\"raw_output\\\": \\\"*14:28:56.590 UTC Mon Oct 19 2026\\\"\\n}\"}], … ,\"isError\":false}}"
+          }
+        }
+      ]
+    }
+  },
+  "tries": […], "workspace_name": "default", …
+}
+```
+
+Things to notice:
+- The request and reply are JSON **inside a string**, which is why they're
+  full of `\"`.
+- A **denied** call has an `audit` entry with `"action": "deny"` and no
+  `rpc`, because Kong answered 403 itself. A request **without a token**
+  has no `ai` section at all, just `"response": {"status": 401}`.
+- When it receives the record, Vector adds `timestamp`, `path` and
+  `source_type`. These fields don't come from Kong.
+
+#### ② What Vector sends to Loki
+
+The `mcp_events` transform turns the record into one flat event per `rpc`
+entry. It keeps the fields above, unpacks the tool arguments and the
+tool's text output, and adds a `level`:
+
+```json
+{
+  "timestamp": "2026-10-19T14:28:52.861Z",
+  "user": "netops-viewer-user",
+  "role": "netops-viewer",
+  "session": "730c63ba3c864d7d8dc447b91bb3c50a",
+  "method": "tools/call",
+  "tool": "pyats_run_show_command",
+  "rpc_id": "3",
+  "action": "allow",
+  "status": 200,
+  "latency_ms": 14126,
+  "arguments": "{\"command\":\"show clock\",\"device_name\":\"R1\"}",
+  "request": "{\"method\":\"tools/call\",\"id\":3,\"params\":{\"arguments\":{\"device_name\":\"R1\",\"command\":\"show clock\"},\"name\":\"pyats_run_show_command\"},\"jsonrpc\":\"2.0\"}",
+  "response": "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"…\"}],…,\"isError\":false}}",
+  "result": "{\n  \"status\": \"completed\",\n  \"device\": \"R1\",\n  \"command\": \"show clock\",\n  \"raw_output\": \"*14:28:56.590 UTC Mon Oct 19 2026\"\n}",
+  "is_error": false,
+  "error": null,
+  "level": "info",
+  "client_ip": "192.168.65.1",
+  "kong_request_id": "4c351702abff7c630e74a644c17ea369"
+}
+```
+
+`level` is `info`, `warn` for a denied or rejected call, or `error` when the
+tool failed. Without it, Loki guesses a level by looking for words like
+"error" in the line, and it would mark every event as an error because of
+the `is_error` and `error` fields.
+
+#### ③ How Loki stores it
+
+The loki sink splits the event into the three things Loki stores: a
+**stream** (the set of labels), a **timestamp** in nanoseconds, and the
+**log line**. The labels are the ones listed under `labels:` in
+[observability/vector.yaml](observability/vector.yaml). The line is the
+whole event as JSON, minus `timestamp`. Querying Loki's API directly shows
+exactly that:
+
+```json
+{
+  "stream": {
+    "job": "kong-mcp",
+    "mcp_server": "pyats-tools",
+    "method": "tools/call",
+    "tool": "pyats_run_show_command",
+    "action": "allow",
+    "role": "netops-viewer",
+    "user": "netops-viewer-user",
+    "service_name": "kong-mcp",
+    "detected_level": "info"
+  },
+  "values": [
+    [ "1792420132861000000",
+      "{\"action\":\"allow\",\"arguments\":\"{\\\"command\\\":\\\"show clock\\\",…}\",…,\"user\":\"netops-viewer-user\"}" ]
+  ]
+}
+```
+
+Loki adds two labels of its own: `service_name`, copied from `job`, and
+`detected_level`, taken from the `level` field. Every distinct combination
+of labels is a separate stream, which is why labels must stay few and short.
+The request, reply and arguments live in the line.
+
+```mermaid
+flowchart LR
+    ev["Vector event<br/>(flat JSON)"]
+    ev -- "user, role, tool, action,<br/>method + job, mcp_server" --> st["🏷️ stream labels<br/>(indexed)"]
+    ev -- "timestamp" --> ts["🕒 timestamp<br/>(nanoseconds)"]
+    ev -- "the whole event as JSON<br/>(minus timestamp)" --> ln["📄 log line<br/>(not indexed)"]
+    loki["Loki adds<br/>service_name, detected_level"] -.-> st
+```
+
+#### ④ How it looks in Grafana
+
+Grafana reaches Loki through the **Loki data source**
+([observability/grafana/provisioning/datasources/loki.yaml](observability/grafana/provisioning/datasources/loki.yaml),
+URL `http://loki:3100`). A panel or an Explore query sends LogQL, and the
+data source returns a table with **one row per log line**:
+
+| Column | Example | What it is |
+|---|---|---|
+| `Time` | `2026-10-19 14:28:52.861` | The event timestamp |
+| `Line` | `{"action":"allow","arguments":…}` | The log line, the JSON from ② |
+| `labels` | `{"job":"kong-mcp","user":"netops-viewer-user",…}` | The stream labels, plus any fields the query extracted |
+| `tsNs`, `id`, `labelTypes` | `1792420132861000000` | Internal: precise timestamp, row ID, label kinds |
+
+Add `| json` to the query and Loki also unpacks the line, so every JSON
+field shows up under `labels` and can be filtered on:
+
+```logql
+{job="kong-mcp", tool="pyats_run_show_command"} | json | latency_ms > 5000
+```
+
+```jsonc
+// labels of the row, after "| json"
+{
+  "job": "kong-mcp", "mcp_server": "pyats-tools", "service_name": "kong-mcp",
+  "detected_level": "info",
+  "user": "netops-viewer-user", "user_extracted": "netops-viewer-user",
+  "role": "netops-viewer",      "role_extracted": "netops-viewer",
+  "tool": "pyats_run_show_command", "tool_extracted": "pyats_run_show_command",
+  "action": "allow",            "action_extracted": "allow",
+  "method": "tools/call",       "method_extracted": "tools/call",
+  "status": "200", "latency_ms": "14126", "is_error": "false",
+  "arguments": "{\"command\":\"show clock\",\"device_name\":\"R1\"}",
+  "result": "{\n  \"status\": \"completed\", … }",
+  "request": "…", "response": "…", "session": "…", "rpc_id": "3", …
+}
+```
+
+Two things to notice:
+- **Everything becomes a string.** `latency_ms > 5000` still works because
+  LogQL converts numbers when you compare them.
+- **`_extracted` suffixes.** When a JSON field has the same name as an
+  existing label (`user`, `tool`, ...), Loki keeps the label and adds the
+  JSON value as `<name>_extracted`. They hold the same value here.
+
+How the dashboard uses this:
+
+- **Counters and charts** like "Tool calls by user" use metric queries such
+  as `sum by (user) (count_over_time({…, method="tools/call"}[$__auto]))`.
+  Loki counts lines per label and returns numbers, not lines.
+- **The "Tool calls" table** asks for raw lines. A Grafana transformation,
+  *Extract fields* on the `Line` column, turns the JSON into columns.
+  *Organize fields* then hides the ones you don't need and orders the rest
+  (when, user, role, tool, action, status, latency, arguments, result).
+- **The "Inbound request and outbound reply" panel** uses `| json |
+  line_format "…"` to rewrite each line as
+  `user (role) action tool -> status`, followed by the request and the
+  response. Click a line to see all its fields.
+- In **Explore**, pick the Loki data source, run
+  `{job="kong-mcp"} | json`, and click any line. *Log details* lists every
+  label and field, with buttons to filter on a value or exclude it.
+
 ### Where to look
 
 Vector and Loki have no web UI. You see their configs as files and their
@@ -577,32 +944,33 @@ laptop, so reach it from a container on the Docker network.
 | Browse and search the events | Grafana → **Explore** → **Loki** |
 | See how a dashboard panel is built | Grafana → panel menu → **Edit** |
 
-## Keycloak issuer note
+## Reference
 
-`KC_HOSTNAME=http://localhost:8080` pins the token issuer to the host-facing
-URL, so a token fetched from the laptop validates in Kong, which reaches
-Keycloak as `keycloak:8080`. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` keeps
-`jwks_uri` / `token_endpoint` on whatever host was used:
+### What's in here
 
-```bash
-docker run --rm --network kong-workshop curlimages/curl -s \
-  http://keycloak:8080/realms/kong/.well-known/openid-configuration | jq '{issuer, jwks_uri}'
-# issuer   => http://localhost:8080/realms/kong
-# jwks_uri => http://keycloak:8080/realms/kong/protocol/openid-connect/certs
-```
+| Path | Purpose |
+|---|---|
+| [docker-compose.yml](docker-compose.yml) | `kong-ai-dp`, `keycloak` + `postgres`, `pyats-mcp`; `vector`, `loki`, `grafana` in the `observability` profile |
+| [konnect/create-ai-gateway.sh](konnect/create-ai-gateway.sh) | Creates the AI Gateway in Konnect, the data plane certificate and the `AI_*` values in `.env` |
+| [konnect/create-mcp-acl.sh](konnect/create-mcp-acl.sh) | Creates the `pyats-tools` MCP server, the `keycloak-kong` auth strategy, the two AI Consumers and the access rules |
+| [konnect/create-mcp-observability.sh](konnect/create-mcp-observability.sh) | Creates the `mcp-http-log` policy and attaches it to `pyats-tools` (`remove` undoes it) |
+| [observability/](observability/) | Vector pipeline, Grafana data source and the MCP dashboard |
+| [keycloak/setup.sh](keycloak/setup.sh) | Creates the `kong` realm, `mcp-client`, the `mcp_role` claim and the two users |
+| [keycloak/mcp-auth.sh](keycloak/mcp-auth.sh) | `login` / `status` / `logout`, and the `headers` helper Claude Code runs |
+| [keycloak/test-mcp-acl.sh](keycloak/test-mcp-acl.sh) | Checks the rules through Kong as each user |
+| [.mcp.json](.mcp.json), [.claude/settings.json](.claude/settings.json) | The `pyats` server for Claude Code, pre-approved |
 
-## Why consumers instead of matching the claim directly
+### Ports
 
-The MCP server can match rules against a token claim directly
-(`acl_attribute_type: oauth_access_token`). With this setup the gateway
-rejected that with "access token claims not available"; it seems to need
-the `access.metadata` OAuth setup. Mapping `mcp_role` to one AI Consumer per
-role keeps Keycloak as the only place that assigns roles, with just two
-objects in Kong. The trade-off: Konnect's analytics and logs show the role,
-not the individual user. The user still reaches pyATS in the
-`X-Authenticated-User` header (see step 3).
+| Port | Service |
+|---|---|
+| 8010 / 8453 | AI Gateway proxy (http / https) |
+| 8110 | AI Gateway status |
+| 8080 | Keycloak (admin / admin) |
 
-## Debugging pyats-mcp directly
+Loki (3100) and Vector (9880) are reachable only inside the Docker network.
+
+### Debugging pyats-mcp directly
 
 `pyats-mcp` isn't published on the host. Call it from a container on the
 same network:
@@ -614,7 +982,7 @@ docker run --rm --network kong-workshop curlimages/curl -s -X POST \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-## Undo / tear down
+### Undo / tear down
 
 ```bash
 docker compose --profile observability down   # add -v to also delete Keycloak's database and the stored events

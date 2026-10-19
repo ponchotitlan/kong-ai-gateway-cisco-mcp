@@ -699,7 +699,8 @@
               "is_error": true,
               "error": true,
               "labelTypes": true,
-              "timestamp": true
+              "timestamp": true,
+              "level": true
             },
             "indexByName": {
               "Time": 0,

@@ -5,7 +5,9 @@
 # Event fields: user (Keycloak preferred_username, from X-Authenticated-User),
 # role (AI Consumer), session, method, tool, action (allow / deny / reject),
 # status, latency_ms, arguments, request (inbound JSON-RPC), response
-# (outbound reply), result (the tool's text output), is_error, error.
+# (outbound reply), result (the tool's text output), is_error, error, level
+# (info / warn for deny and reject / error; without it Loki guesses "error"
+# from the field names).
 
 sources:
   kong:
@@ -47,6 +49,9 @@ transforms:
           for_each(audits) -> |_i, a| {
             if a.action == "deny" { action = "deny" }
           }
+          is_error = exists(resp.error) || resp.result.isError == true
+          level = "info"
+          if is_error { level = "error" }
           merge(base, {
             "method": rpc.method || "-",
             "tool": tool,
@@ -57,8 +62,9 @@ transforms:
             "request": rpc.payload.request,
             "response": resp_raw,
             "result": resp.result.content[0].text,
-            "is_error": exists(resp.error) || resp.result.isError == true,
-            "error": resp.error.message
+            "is_error": is_error,
+            "error": resp.error.message,
+            "level": level
           })
         }
       } else if length(audits) > 0 {
@@ -70,10 +76,11 @@ transforms:
           "method": method,
           "tool": a.primitive_name || "-",
           "action": a.action || "deny",
-          "is_error": true
+          "is_error": true,
+          "level": "warn"
         })]
       } else if r.response.status == 401 {
-        events = [merge(base, {"method": "-", "tool": "-", "action": "reject", "is_error": true})]
+        events = [merge(base, {"method": "-", "tool": "-", "action": "reject", "is_error": true, "level": "warn"})]
       }
       . = events
 
