@@ -1,0 +1,97 @@
+# Receives the AI Gateway's http-log records (policy "mcp-http-log", see
+# konnect/create-mcp-observability.sh) and turns each into one event per MCP
+# JSON-RPC call, then ships them to Loki.
+#
+# Event fields: user (Keycloak preferred_username, from X-Authenticated-User),
+# role (AI Consumer), session, method, tool, action (allow / deny / reject),
+# status, latency_ms, arguments, request (inbound JSON-RPC), response
+# (outbound reply), result (the tool's text output), is_error, error.
+
+sources:
+  kong:
+    type: http_server
+    address: 0.0.0.0:9880
+    path: /kong
+    decoding:
+      codec: json
+
+transforms:
+  mcp_events:
+    type: remap
+    inputs: [kong]
+    source: |
+      r = .
+      ts = from_unix_timestamp(to_int(r.started_at) ?? 0, unit: "milliseconds") ?? now()
+      base = {
+        "timestamp": ts,
+        "user": r.request.headers."x-authenticated-user" || "anonymous",
+        "role": r.consumer.username || "none",
+        "session": r.ai.mcp.mcp_session_id || "",
+        "status": r.response.status,
+        "client_ip": r.client_ip,
+        "kong_request_id": r.response.headers."x-kong-request-id" || ""
+      }
+      audits = array(r.ai.mcp.audit) ?? []
+      rpcs = array(r.ai.mcp.rpc) ?? []
+
+      events = []
+      if length(rpcs) > 0 {
+        events = map_values(rpcs) -> |rpc| {
+          req = parse_json(string(rpc.payload.request) ?? "") ?? {}
+          resp_raw = string(rpc.payload.response) ?? ""
+          resp = parse_json(resp_raw) ?? {}
+          tool = rpc.tool_name || req.params.name || "-"
+          args = req.params.arguments
+          if args != null { args = encode_json(args) }
+          action = "allow"
+          for_each(audits) -> |_i, a| {
+            if a.action == "deny" { action = "deny" }
+          }
+          merge(base, {
+            "method": rpc.method || "-",
+            "tool": tool,
+            "rpc_id": rpc.id || "",
+            "action": action,
+            "latency_ms": rpc.latency,
+            "arguments": args,
+            "request": rpc.payload.request,
+            "response": resp_raw,
+            "result": resp.result.content[0].text,
+            "is_error": exists(resp.error) || resp.result.isError == true,
+            "error": resp.error.message
+          })
+        }
+      } else if length(audits) > 0 {
+        # Denied by the ACL: Kong answers 403 itself and pyATS never sees it.
+        a = object(audits[0]) ?? {}
+        method = "-"
+        if a.primitive == "tool" { method = "tools/call" }
+        events = [merge(base, {
+          "method": method,
+          "tool": a.primitive_name || "-",
+          "action": a.action || "deny",
+          "is_error": true
+        })]
+      } else if r.response.status == 401 {
+        events = [merge(base, {"method": "-", "tool": "-", "action": "reject", "is_error": true})]
+      }
+      . = events
+
+sinks:
+  loki:
+    type: loki
+    inputs: [mcp_events]
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+      except_fields: [timestamp]
+    # Low-cardinality labels to filter on; the rest stays in the JSON line.
+    labels:
+      job: kong-mcp
+      mcp_server: pyats-tools
+      method: "{{ method }}"
+      tool: "{{ tool }}"
+      action: "{{ action }}"
+      role: "{{ role }}"
+      user: "{{ user }}"
+    out_of_order_action: accept

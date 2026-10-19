@@ -1,4 +1,4 @@
-# Kong AI Gateway: Keycloak auth and MCP tool authorization
+# NetOps with Kong AI Gateway and Cisco MCP servers
 
 [![Kong AI Gateway](https://img.shields.io/badge/Kong_AI_Gateway-2.0.3-003459?style=flat&logo=kong&logoColor=white)](https://konghq.com/products/kong-ai-gateway)
 [![Kong Konnect](https://img.shields.io/badge/Kong_Konnect-cloud-003459?style=flat&logo=kong&logoColor=white)](https://cloud.konghq.com)
@@ -114,9 +114,11 @@ Every allow/deny decision is written to the AI Gateway's audit log.
 
 | Path | Purpose |
 |---|---|
-| [docker-compose.yml](docker-compose.yml) | `kong-ai-dp`, `keycloak` + `postgres`, `pyats-mcp` |
+| [docker-compose.yml](docker-compose.yml) | `kong-ai-dp`, `keycloak` + `postgres`, `pyats-mcp`; `vector`, `loki`, `grafana` in the `observability` profile |
 | [konnect/create-ai-gateway.sh](konnect/create-ai-gateway.sh) | Creates the AI Gateway in Konnect, the data plane certificate and the `AI_*` values in `.env` |
 | [konnect/create-mcp-acl.sh](konnect/create-mcp-acl.sh) | Creates the `pyats-tools` MCP server, the `keycloak-kong` auth strategy, the two AI Consumers and the access rules |
+| [konnect/create-mcp-observability.sh](konnect/create-mcp-observability.sh) | Creates the `mcp-http-log` policy and attaches it to `pyats-tools` (`remove` undoes it) |
+| [observability/](observability/) | Vector pipeline, Grafana data source and the MCP dashboard |
 | [keycloak/setup.sh](keycloak/setup.sh) | Creates the `kong` realm, `mcp-client`, the `mcp_role` claim and the two users |
 | [keycloak/mcp-auth.sh](keycloak/mcp-auth.sh) | `login` / `status` / `logout`, and the `headers` helper Claude Code runs |
 | [keycloak/test-mcp-acl.sh](keycloak/test-mcp-acl.sh) | Checks the rules through Kong as each user |
@@ -340,6 +342,241 @@ a separate step.
 - `claude mcp get pyats` says *Rejected*: remove `pyats` from
   `disabledMcpjsonServers` in your `.claude/settings.local.json`.
 
+## Step 5 (optional): Observe MCP tool use in Grafana
+
+The `observability` compose profile adds Vector, Loki and Grafana. An
+`http-log` policy on `pyats-tools` makes the AI Gateway POST a log record
+for every MCP request to Vector. Vector turns each record into one event per
+JSON-RPC call and ships it to Loki, and Grafana shows them.
+
+```mermaid
+flowchart LR
+    dp["kong-ai-dp<br/>policy mcp-http-log"] -- "http-log JSON" --> v["vector<br/>:9880/kong"]
+    v -- "one event per MCP call" --> l[("loki")]
+    l --> g["grafana<br/>:3000"]
+```
+
+1. Start the stack:
+   ```bash
+   docker compose --profile observability up -d
+   ```
+2. Create the `mcp-http-log` policy and attach it to `pyats-tools`:
+   ```bash
+   ./konnect/create-mcp-observability.sh
+   ```
+3. Use the MCP server (Claude Code, step 4a, or `./keycloak/test-mcp-acl.sh`),
+   then open http://localhost:3000. The **MCP tool usage (Kong AI Gateway)**
+   dashboard is the home page; anyone can view it, and `admin` / `admin`
+   can edit.
+
+Each event has:
+
+| Field | Meaning |
+|---|---|
+| time | When Kong received the request |
+| `user` | Keycloak `preferred_username` (the `X-Authenticated-User` header), `anonymous` without a token |
+| `role` | AI Consumer, from `mcp_role` |
+| `method`, `tool` | JSON-RPC method (`tools/call`, `tools/list`, ...) and tool name |
+| `action` | `allow`, `deny` (blocked by a tool ACL, 403, never reaches pyATS) or `reject` (401, no valid token) |
+| `status`, `latency_ms` | HTTP status Kong returned; time pyATS took to answer |
+| `arguments`, `request` | Tool arguments; the inbound JSON-RPC request |
+| `response`, `result` | The outbound JSON-RPC reply; the tool's text output |
+| `is_error`, `error` | JSON-RPC error or `isError` in the tool result |
+
+`job`, `method`, `tool`, `action`, `role` and `user` are Loki labels, the
+rest is in the JSON line. For ad-hoc queries, use Grafana's **Explore** with
+for example `{job="kong-mcp", method="tools/call", user="netops-viewer-user"} | json`.
+Kong redacts the `Authorization` header before logging, so tokens are never
+stored. A denied call has no request or reply in its event: Kong blocks it
+before it reaches pyATS, and the AI Gateway logs only the decision and the
+tool name.
+
+The dashboard: totals (tool calls, denied, tool errors, active users, 401s),
+calls over time by tool and by user, a who-called-what table, latency per
+tool, a table of every call with its arguments and result, and a log panel
+with each inbound request and outbound reply (expand a line for all fields).
+Filter with the **User**, **Role**, **Tool** and **Decision** variables.
+
+**If no events arrive:** `docker logs kong-ai-dp | grep http-log`. A
+"connection refused" for `vector:9880` after recreating the `vector`
+container means Kong still has its old IP address cached; restart
+`kong-ai-dp` or wait for the DNS entry to expire. Konnect takes a few
+seconds to push the policy to the data plane.
+
+To stop sending logs, run `./konnect/create-mcp-observability.sh remove`,
+then `docker compose --profile observability down` (add `-v` to delete the
+stored events and Grafana's state).
+
+## How the observability stack works
+
+New to Vector and Loki? This section explains what each piece does, how
+they connect, and where to look when you want to see what's going on.
+
+### The short version
+
+Think of a parcel service:
+
+| Piece | Role in one line | Analogy |
+|---|---|---|
+| **Kong AI Gateway** | Writes a log record for every MCP request | The shop that hands over parcels |
+| **Vector** | Receives the records, reshapes them, forwards them | The sorting center: opens, relabels, sends on |
+| **Loki** | Stores the events and answers questions about them | The warehouse with an index |
+| **Grafana** | Shows the events as dashboards and lets you search them | The front desk where you ask "where's my parcel?" |
+
+Vector never keeps anything, Loki never draws anything, and Grafana never
+stores anything. Each one does one job.
+
+```mermaid
+flowchart LR
+    kong["🛡️ Kong AI Gateway<br/><i>writes a record per request</i>"]
+    vector["🔀 Vector<br/><i>reshapes and forwards</i>"]
+    loki[("🗄️ Loki<br/><i>stores and indexes</i>")]
+    grafana["📊 Grafana<br/><i>shows and searches</i>"]
+    you(["👤 You"])
+
+    kong -- "HTTP POST<br/>raw JSON record" --> vector
+    vector -- "HTTP push<br/>clean events" --> loki
+    grafana -- "LogQL query" --> loki
+    you -- "browser<br/>localhost:3000" --> grafana
+```
+
+### What happens when someone calls a tool
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as netops-viewer-user
+    participant G as Kong AI Gateway
+    participant P as pyats-mcp
+    participant V as Vector
+    participant L as Loki
+    participant D as Grafana
+
+    U->>G: tools/call pyats_run_show_command
+    G->>P: forwards the call (ACL allows it)
+    P-->>G: tool result
+    G-->>U: tool result
+    Note over G: After replying, Kong sends the log record<br/>in the background, so the user never waits for it
+    G->>V: POST /kong with one JSON record
+    V->>V: keep only what matters:<br/>who, tool, decision, request, reply
+    V->>L: push the event
+    D->>L: dashboard refreshes every 10 s
+    L-->>D: matching events
+```
+
+### Vector: the sorting center
+
+Vector is a small program that moves data from A to B and can change it on
+the way. Every Vector config has the same three parts, and ours is
+[observability/vector.yaml](observability/vector.yaml):
+
+```mermaid
+flowchart LR
+    subgraph vector["Vector (observability/vector.yaml)"]
+        direction LR
+        src["📥 <b>source</b> kong<br/>listens on :9880/kong<br/>for Kong's JSON"]
+        tr["⚙️ <b>transform</b> mcp_events<br/>small script that picks<br/>and renames fields"]
+        sink["📤 <b>sink</b> loki<br/>pushes events to<br/>http://loki:3100"]
+        src --> tr --> sink
+    end
+    kong["Kong"] --> src
+    sink --> loki[("Loki")]
+```
+
+- **Source:** where data comes in. Here, an HTTP endpoint that Kong posts to.
+- **Transform:** what happens to it. Kong's record is large and nested. The
+  script, written in Vector's language VRL, pulls out the user, role, tool,
+  decision, latency, request and reply. One Kong record can hold several MCP
+  calls, so it can become several events.
+- **Sink:** where data goes out. Here, Loki.
+
+```mermaid
+flowchart LR
+    rec["<b>1 Kong record</b><br/>dozens of nested fields: headers,<br/>latencies, consumer, route, ai.mcp.rpc[ ], ai.mcp.audit[ ]"]
+    rec --> e1["<b>event</b><br/>user: netops-viewer-user<br/>role: netops-viewer<br/>tool: pyats_run_show_command<br/>action: allow · status: 200<br/>request / response"]
+    rec -. "if it held more<br/>MCP calls" .-> e2["<b>event</b><br/>..."]
+```
+
+### Loki: the warehouse
+
+Loki is a database built for logs. Its main trick is that it splits every
+event into two parts:
+
+- **Labels**: a few short tags (`user`, `role`, `tool`, `action`, `method`,
+  `job`). Loki indexes these, so filtering on them is fast. Think of them as
+  the label on the outside of a box.
+- **The log line**: the full JSON event, including the request and reply.
+  It isn't indexed. Loki reads it only for the events the labels already
+  matched. This is the contents of the box.
+
+```mermaid
+flowchart TB
+    subgraph event["One stored event"]
+        direction LR
+        labels["🏷️ <b>Labels</b> (indexed, for filtering)<br/>job=kong-mcp<br/>user=netops-viewer-user<br/>role=netops-viewer<br/>tool=pyats_run_show_command<br/>action=allow · method=tools/call"]
+        line["📄 <b>Log line</b> (the full JSON)<br/>status, latency_ms, arguments,<br/>request, response, result, error ..."]
+    end
+```
+
+You ask Loki questions in **LogQL**. A query always starts with labels in
+`{ }`, and can then dig into the JSON:
+
+```mermaid
+flowchart LR
+    a["<b>{job=&quot;kong-mcp&quot;, user=&quot;netops-viewer-user&quot;}</b><br/>① pick boxes by their labels"]
+    b["<b>| json</b><br/>② open the boxes:<br/>JSON fields become filterable"]
+    c["<b>| status = &quot;403&quot;</b><br/>③ keep only what you want"]
+    a --> b --> c
+```
+
+A few queries to try in Grafana's **Explore**:
+
+| Question | LogQL |
+|---|---|
+| Everything one user did | `{job="kong-mcp", user="netops-viewer-user"}` |
+| Every denied tool call | `{job="kong-mcp", action="deny"}` |
+| Calls to one tool, with fields unpacked | `{job="kong-mcp", tool="pyats_run_show_command"} \| json` |
+| Calls slower than 5 seconds | `{job="kong-mcp", method="tools/call"} \| json \| latency_ms > 5000` |
+| Tool calls per user in the last hour | `sum by (user) (count_over_time({job="kong-mcp", method="tools/call"}[1h]))` |
+
+### Grafana: the front desk
+
+Grafana is the only one with a web UI: http://localhost:3000 (`admin` /
+`admin`, or just view without logging in). Two places matter:
+
+- **Dashboards → Kong AI Gateway → MCP tool usage**: the ready-made view.
+  Every panel is a saved LogQL query. Open a panel's menu → **Edit** to see
+  its query.
+- **Explore** (compass icon in the left menu) → data source **Loki**:
+  write your own queries. Click an event to see all its fields.
+
+Grafana's settings come from files, so nothing is clicked together by hand:
+
+```mermaid
+flowchart LR
+    ds["observability/grafana/provisioning/<br/>datasources/loki.yaml"] -- "adds the Loki<br/>data source" --> gf["Grafana"]
+    prov["observability/grafana/provisioning/<br/>dashboards/dashboards.yaml"] -- "says where<br/>dashboards live" --> gf
+    dash["observability/grafana/dashboards/<br/>mcp-tools.json"] -- "the dashboard" --> gf
+```
+
+### Where to look
+
+Vector and Loki have no web UI. You see their configs as files and their
+state through logs or HTTP endpoints. Loki's port isn't published to your
+laptop, so reach it from a container on the Docker network.
+
+| I want to... | Do this |
+|---|---|
+| See Vector's config | Open [observability/vector.yaml](observability/vector.yaml) |
+| Check Vector is receiving and forwarding | `docker logs vector` (it only prints problems) |
+| Check Kong is sending | `docker logs kong-ai-dp \| grep http-log` (no output means no errors) |
+| See Loki's config file | `docker exec loki cat /etc/loki/local-config.yaml` |
+| See Loki's full config, defaults included | `docker run --rm --network kong-workshop curlimages/curl -s http://loki:3100/config` |
+| Check Loki is up | same command with `http://loki:3100/ready` |
+| List the labels Loki knows | same command with `http://loki:3100/loki/api/v1/labels` |
+| Browse and search the events | Grafana → **Explore** → **Loki** |
+| See how a dashboard panel is built | Grafana → panel menu → **Edit** |
+
 ## Keycloak issuer note
 
 `KC_HOSTNAME=http://localhost:8080` pins the token issuer to the host-facing
@@ -380,7 +617,7 @@ docker run --rm --network kong-workshop curlimages/curl -s -X POST \
 ## Undo / tear down
 
 ```bash
-docker compose down        # add -v to also delete Keycloak's database
+docker compose --profile observability down   # add -v to also delete Keycloak's database and the stored events
 ```
 
 To remove the access control in Konnect, drop the `access` block and tools

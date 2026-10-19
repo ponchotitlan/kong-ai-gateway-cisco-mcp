@@ -13,6 +13,8 @@ networks:
 
 volumes:
   keycloak-db-data:
+  loki-data:
+  grafana-data:
 
 services:
   # ---------------------------------------------------------------------
@@ -126,4 +128,67 @@ services:
       - "8010:8000"
       - "8453:8443"
       - "8110:8100"
+    restart: unless-stopped
+
+  # =====================================================================
+  # Observability (docker compose --profile observability up -d)
+  #
+  #   kong-ai-dp --http-log policy "mcp-http-log"--> vector :9880/kong
+  #     --> one event per MCP call (who, tool, decision, request, reply)
+  #     --> loki --> grafana :3000 (dashboard "MCP tool usage")
+  #
+  # The policy is created by konnect/create-mcp-observability.sh.
+  # =====================================================================
+
+  # Vector - receives Kong's log records and reshapes them for Loki.
+  vector:
+    profiles: [observability]
+    image: timberio/vector:0.49.0-alpine
+    container_name: vector
+    hostname: vector
+    networks:
+      - workshop
+    command: ["--config", "/etc/vector/vector.yaml"]
+    volumes:
+      - ./observability/vector.yaml:/etc/vector/vector.yaml:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # Loki - stores the MCP events (single-node default config).
+  loki:
+    profiles: [observability]
+    image: grafana/loki:3.5.3
+    container_name: loki
+    hostname: loki
+    networks:
+      - workshop
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+
+  # Grafana - Loki data source and the MCP dashboard are provisioned.
+  # admin / admin; anonymous visitors can view.
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:12.1.1
+    container_name: grafana
+    hostname: grafana
+    networks:
+      - workshop
+    depends_on:
+      - loki
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/mcp-tools.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
     restart: unless-stopped
