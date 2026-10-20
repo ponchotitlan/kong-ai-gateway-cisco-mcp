@@ -217,7 +217,6 @@ to the ones in the script, overwriting changes made in the UI.
 > rule. Konnect doesn't check tool names against the server, so a typo
 > silently leaves that tool open to viewers.
 
-![Kong ACLs](images/konnect-acls.png)
 ![Kong MCP Tools](images/konnect-mcp-tools.png)
 ![Kong MCP Tools 2](images/konnect-mcp-tools-2.png)
 
@@ -322,6 +321,8 @@ If the user is not authenticated in the current CLI, Claude Code will fail to co
 
 ![Claude Code Invalid](images/claude-code-invalid-mcp.png)
 
+### Read-only user authenticated = Queries, but no configuration pushing
+
 After logging in with the read-only user via command `.keycloak/mcp-auth.sh login` and restarting Claude Code, the same command shows that the MCP server is available. The tools at our reach are read-only:
 
 ![Claude Code Valid Read-only 1](images/claude-code-valid-readonly-1.png)
@@ -330,6 +331,8 @@ After logging in with the read-only user via command `.keycloak/mcp-auth.sh logi
 Any attempt to push configurations will fail because Claude Code simply doesn't have access to the tools for it:
 
 ![Claude Code Valid Read-only 3](images/claude-code-valid-readonly-3.png)
+
+### Admin user = Queries and configuration pushing
 
 Now, when you login with the admin user and restart Claude Code, all the tools are availabe:
 
