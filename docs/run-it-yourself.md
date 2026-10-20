@@ -45,6 +45,19 @@ root.
    The script creates `ai-gateway-1` (or reuses it), generates
    `certs/kong-ai/tls.crt` / `tls.key`, registers the certificate, and writes
    `AI_GATEWAY_ID` and the `AI_KONNECT_*` endpoints into `.env`.
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1**
+>
+> The new AI Gateway. It's an AI Gateway resource of its own, so it doesn't
+> appear among Gateway Manager's control planes.
+>
+> **Manually:** **AI Gateway → New AI Gateway** runs the same setup as a
+> wizard. Copy the certificate it generates into `certs/kong-ai/`, and its
+> ID and endpoints into the `AI_*` values in `.env`.
+
+![Kong AI Gateway](images/konnect-ai-gateway.png)
+
 3. Start the containers:
    ```bash
    docker compose up -d
@@ -59,6 +72,18 @@ root.
      -H "Authorization: Bearer $PAT" | jq '.data[] | {hostname, version}'
    ```
 
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **Data Plane Nodes**
+>
+> The `kong-ai-dp` container listed as a connected node, running version
+> `2.0.3`.
+>
+> **Manually:** not applicable. A node shows up when a data plane connects
+> with a registered certificate; stopping the container marks it as
+> disconnected.
+
+![Kong Data Plane](images/konnect-dataplane.png)
+
 ## Step 2: Set up the Keycloak users
 
 1. Wait for Keycloak to answer on `http://localhost:8080`, then:
@@ -68,6 +93,52 @@ root.
    This creates the `kong` realm, the public `mcp-client` client (whose
    access tokens carry the `mcp_role` claim), and the two users. It's safe to
    re-run.
+
+> [!NOTE]
+> **🖥️ See it in Keycloak:** http://localhost:8080 (`admin` / `admin`) → realm dropdown **kong** → **Realm settings**
+>
+> **General**: the `kong` realm, enabled. Its **Unmanaged attributes** is set
+> to *Enabled*, which lets users carry the custom `mcp_role` attribute.
+> **Tokens**: **Access Token Lifespan** is 1 hour.
+>
+> **Manually:** use the realm dropdown → **Create realm** and name it `kong`.
+> Then, in **Realm settings → General**, set **Unmanaged attributes** to
+> *Enabled*, and in **Tokens**, set the access token lifespan.
+
+> [!NOTE]
+> **🖥️ See it in Keycloak:** http://localhost:8080 → realm **kong** → **Clients** → **mcp-client**
+>
+> **Settings**: **Client authentication** *Off* (a public client, with no
+> secret); under **Authentication flow**, only **Direct access grants** on.
+> **Client scopes** → **mcp-client-dedicated** → **Mappers** → **mcp_role**:
+> a *User Attribute* mapper that copies the user's `mcp_role` attribute into
+> an `mcp_role` claim in the access token only.
+>
+> **Manually:** **Create client** with client ID `mcp-client`, client
+> authentication off and only direct access grants. Then in **Client scopes
+> → mcp-client-dedicated → Add mapper → By configuration → User Attribute**,
+> set user attribute and token claim name to `mcp_role`, and turn on only
+> **Add to access token**. To check the result, use **Client scopes →
+> Evaluate**, pick a user and open **Generated access token**.
+
+![Keycloak client](images/keycloak-client.png)
+![Keycloak Dedicated Scope](images/keycloak-dedicated-scope.png)
+
+> [!NOTE]
+> **🖥️ See it in Keycloak:** http://localhost:8080 → realm **kong** → **Users** → **netops-viewer-user** / **netops-admin-user**
+>
+> **Details**: username, `@example.com` email (verified), enabled.
+> **Attributes**: `mcp_role` = `netops-viewer` or `netops-admin`; this is
+> the value that picks the user's tools in Kong. **Credentials**: a
+> non-temporary password.
+>
+> **Manually:** **Add user**, then on **Credentials** set a password with
+> **Temporary** off, and on **Attributes** add the key `mcp_role` with the
+> value `netops-viewer` or `netops-admin`. Nothing changes in Kong.
+
+![Keycloak users](images/keycloak-users.png)
+![Keycloak user attributes](images/keycloak-user-attributes.png)
+
 2. Check the users:
    - **Admin console:** open http://localhost:8080, log in as `admin` /
      `admin`, switch the realm dropdown from **master** to **kong**, then
@@ -93,6 +164,63 @@ attribute of `netops-admin` or `netops-viewer`. Nothing changes in Kong.
 This creates the MCP server, the Keycloak auth strategy, the two AI
 Consumers and the tool rules described in
 [Authentication and tool rules](../README.md#2-authentication-and-tool-rules-kong-ai-gateway).
+It's safe to re-run, but it resets the auth strategy and the access rules
+to the ones in the script, overwriting changes made in the UI.
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **MCP servers** → **pyATS Tools**
+>
+> The `pyats-tools` MCP server: a passthrough listener on `/pyats-tools`
+> forwarding to `http://pyats-mcp:8000/mcp`, with audit and payload logging
+> on.
+>
+> **Manually:** add an MCP server of type passthrough listener with that
+> path and upstream URL, and turn on audit and payload logging.
+
+![Kong MCP Server](images/konnect-mcp-server.png)
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **Auth Strategies** → **Keycloak (kong realm)**
+>
+> The OpenID Connect strategy: issuer `http://keycloak:8080/realms/kong`,
+> bearer auth, the `mcp_role` claim mapped to a consumer by username, and
+> `preferred_username` forwarded upstream as `X-Authenticated-User`.
+>
+> **Manually:** add an OpenID Connect auth strategy with those values. The
+> UI form may not show the upstream header fields (`upstream_headers_claims`,
+> `upstream_headers_names`); if it doesn't, set them with the script or the
+> API.
+
+![Kong Auth Strategy 1](images/konnect-auth-strategy-1.png)
+![Kong Auth Strategy 2](images/konnect-auth-strategy-2.png)
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **Consumers**
+>
+> The two AI Consumers, `netops-admin` and `netops-viewer`, one per Keycloak
+> role. There's one per role, not one per user: users live only in Keycloak.
+>
+> **Manually:** add an AI Consumer per role. Its name must match the
+> `mcp_role` value exactly.
+
+![Kong consumers](images/konnect-consumers.png)
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **MCP servers** → **pyATS Tools** → **ACLs** and **Tools**
+>
+> **ACLs**: auth strategy `keycloak-kong`, attribute type *consumer*, both
+> roles allowed to connect, and the **Default tool ACL** allowing both.
+> **Tools**: only the four admin-only tools, each allowing `netops-admin`.
+> The other five tools aren't listed: they fall under the default tool ACL.
+>
+> **Manually:** set the same ACLs and add each admin-only tool with its own
+> rule. Konnect doesn't check tool names against the server, so a typo
+> silently leaves that tool open to viewers.
+
+![Kong ACLs](images/konnect-acls.png)
+![Kong MCP Tools](images/konnect-mcp-tools.png)
+![Kong MCP Tools 2](images/konnect-mcp-tools-2.png)
+
 Then check all the cases at once:
 
 ```bash
@@ -152,6 +280,12 @@ The same commands work in bash and zsh. Repeat with
 ## Step 4b: Use it from Claude Code
 
 1. Log in once in a terminal, with any user from the **kong** realm:
+
+   | Username | Password | Role (`mcp_role`) | Tools in Claude Code |
+   |---|---|---|---|
+   | `netops-viewer-user` | `kong` | `netops-viewer` | 5 read-only tools |
+   | `netops-admin-user` | `kong` | `netops-admin` | all 9, including config changes |
+
    ```bash
    ./keycloak/mcp-auth.sh login     # prompts for username / password
    ./keycloak/mcp-auth.sh status    # Logged in as netops-viewer-user (mcp_role: netops-viewer)
@@ -182,6 +316,29 @@ The same commands work in bash and zsh. Repeat with
 How the login and token refresh work is described in
 [Connecting Claude Code](../README.md#3-connecting-claude-code).
 
+### User not authenticated = MCP tools not authorized
+
+If the user is not authenticated in the current CLI, Claude Code will fail to connect to the MCP server. You can test that by issuing the command `/mcp` within Claude Code. The following error will appear:
+
+![Claude Code Invalid](images/claude-code-invalid-mcp.png)
+
+After logging in with the read-only user via command `.keycloak/mcp-auth.sh login` and restarting Claude Code, the same command shows that the MCP server is available. The tools at our reach are read-only:
+
+![Claude Code Valid Read-only 1](images/claude-code-valid-readonly-1.png)
+![Claude Code Valid Read-only 2](images/claude-code-valid-readonly-2.png)
+
+Any attempt to push configurations will fail because Claude Code simply doesn't have access to the tools for it:
+
+![Claude Code Valid Read-only 3](images/claude-code-valid-readonly-3.png)
+
+Now, when you login with the admin user and restart Claude Code, all the tools are availabe:
+
+![Claude Code Valid Admin 1](images/claude-code-valid-admin-1.png)
+
+Everything is allowed, including pushing new configurations:
+
+![Claude Code Valid Admin 2](images/claude-code-valid-admin-2.png)
+
 ## Step 5 (optional): Observe MCP tool use in Grafana
 
 The `observability` compose profile adds Vector, Loki and Grafana. An
@@ -204,6 +361,21 @@ flowchart LR
    ```bash
    ./konnect/create-mcp-observability.sh
    ```
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **Policies** → **MCP logs to Vector**, and **MCP servers** → **pyATS Tools** → **Policies**
+>
+> The `mcp-http-log` policy of type HTTP Log, posting to
+> `http://vector:9880/kong`, and the same policy attached to the pyATS
+> Tools MCP server.
+>
+> **Manually:** add an HTTP Log policy with that endpoint (method `POST`,
+> content type `application/json`), then attach it to pyATS Tools.
+> `./konnect/create-mcp-observability.sh remove` detaches and deletes it.
+
+![Kong MCP Policies](images/konnect-mcp-policies.png)
+![Kong MCP Tools Policy](images/konnect-tools-policy.png)
+
 3. Use the MCP server (Claude Code, step 4a, or `./keycloak/test-mcp-acl.sh`),
    then open http://localhost:3000. The **MCP tool usage (Kong AI Gateway)**
    dashboard is the home page; anyone can view it, and `admin` / `admin`
@@ -232,8 +404,6 @@ stored events and Grafana's state).
 
 Loki (3100) and Vector (9880) are reachable only inside the Docker network.
 
-Loki (3100) and Vector (9880) are reachable only inside the Docker network.
-
 ## Debugging pyats-mcp directly
 
 `pyats-mcp` isn't published on the host. Call it from a container on the
@@ -255,6 +425,16 @@ docker compose --profile observability down   # add -v to also delete Keycloak's
 To remove the access control in Konnect, drop the `access` block and tools
 from `pyats-tools` (UI or a PUT), then delete the `keycloak-kong` auth
 strategy and the two AI Consumers.
+
+> [!NOTE]
+> **🖥️ See it in Konnect:** https://cloud.konghq.com → **AI Gateway** → **ai_gateway_1** → **MCP servers** → **pyATS Tools** (ACLs, Tools, Policies), **Auth Strategies**, **Consumers** and **Policies**
+>
+> After cleanup, pyATS Tools has no ACLs, tool rules or policies, and the
+> auth strategy, consumers and `mcp-http-log` policy are gone.
+>
+> **Manually:** every step above can be done in the UI. Detach things from
+> pyATS Tools first (ACLs, tools, policies), then delete the auth strategy,
+> the consumers and the policy themselves.
 
 ---
 

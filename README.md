@@ -297,33 +297,6 @@ sequenceDiagram
 
 Every allow/deny decision is written to the AI Gateway's audit log.
 
-### Design notes
-
-#### Why consumers instead of matching the claim directly
-
-The MCP server can match rules against a token claim directly
-(`acl_attribute_type: oauth_access_token`). With this setup the gateway
-rejected that with "access token claims not available"; it seems to need
-the `access.metadata` OAuth setup. Mapping `mcp_role` to one AI Consumer per
-role keeps Keycloak as the only place that assigns roles, with just two
-objects in Kong. The trade-off: Konnect's analytics and logs show the role,
-not the individual user. The user still reaches pyATS in the
-`X-Authenticated-User` header (see [Authentication and tool rules](#2-authentication-and-tool-rules-kong-ai-gateway)).
-
-#### Keycloak issuer
-
-`KC_HOSTNAME=http://localhost:8080` pins the token issuer to the host-facing
-URL, so a token fetched from the laptop validates in Kong, which reaches
-Keycloak as `keycloak:8080`. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` keeps
-`jwks_uri` / `token_endpoint` on whatever host was used:
-
-```bash
-docker run --rm --network kong-workshop curlimages/curl -s \
-  http://keycloak:8080/realms/kong/.well-known/openid-configuration | jq '{issuer, jwks_uri}'
-# issuer   => http://localhost:8080/realms/kong
-# jwks_uri => http://keycloak:8080/realms/kong/protocol/openid-connect/certs
-```
-
 ## What's in here
 
 | Path | Purpose |

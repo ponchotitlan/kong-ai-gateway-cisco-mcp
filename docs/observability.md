@@ -53,19 +53,12 @@ Filter with the **User**, **Role**, **Tool** and **Decision** variables.
 
 ## How the observability stack works
 
-New to Vector and Loki? This section explains what each piece does, how
-they connect, and where to look when you want to see what's going on.
-
-### The short version
-
-Think of a parcel service:
-
-| Piece | Role in one line | Analogy |
+| Piece | Role |
 |---|---|---|
-| **Kong AI Gateway** | Writes a log record for every MCP request | The shop that hands over parcels |
-| **Vector** | Receives the records, reshapes them, forwards them | The sorting center: opens, relabels, sends on |
-| **Loki** | Stores the events and answers questions about them | The warehouse with an index |
-| **Grafana** | Shows the events as dashboards and lets you search them | The front desk where you ask "where's my parcel?" |
+| **Kong AI Gateway** | Writes a log record for every MCP request |
+| **Vector** | Receives the records, reshapes them, forwards them |
+| **Loki** | Stores the events and answers to queries in LogQL language|
+| **Grafana** | Shows the events as dashboards and lets you search them |
 
 Vector never keeps anything, Loki never draws anything, and Grafana never
 stores anything. Each one does one job.
@@ -167,9 +160,9 @@ You ask Loki questions in **LogQL**. A query always starts with labels in
 
 ```mermaid
 flowchart LR
-    a["<b>{job=&quot;kong-mcp&quot;, user=&quot;netops-viewer-user&quot;}</b><br/>① pick boxes by their labels"]
+    a["<b>{job=#quot;kong-mcp#quot;, user=#quot;netops-viewer-user#quot;}</b><br/>① pick boxes by their labels"]
     b["<b>| json</b><br/>② open the boxes:<br/>JSON fields become filterable"]
-    c["<b>| status = &quot;403&quot;</b><br/>③ keep only what you want"]
+    c["<b>| status = #quot;403#quot;</b><br/>③ keep only what you want"]
     a --> b --> c
 ```
 
@@ -426,23 +419,8 @@ How the dashboard uses this:
   `{job="kong-mcp"} | json`, and click any line. *Log details* lists every
   label and field, with buttons to filter on a value or exclude it.
 
-### Where to look
-
-Vector and Loki have no web UI. You see their configs as files and their
-state through logs or HTTP endpoints. Loki's port isn't published to your
-laptop, so reach it from a container on the Docker network.
-
-| I want to... | Do this |
-|---|---|
-| See Vector's config | Open [observability/vector.yaml](../observability/vector.yaml) |
-| Check Vector is receiving and forwarding | `docker logs vector` (it only prints problems) |
-| Check Kong is sending | `docker logs kong-ai-dp \| grep http-log` (no output means no errors) |
-| See Loki's config file | `docker exec loki cat /etc/loki/local-config.yaml` |
-| See Loki's full config, defaults included | `docker run --rm --network kong-workshop curlimages/curl -s http://loki:3100/config` |
-| Check Loki is up | same command with `http://loki:3100/ready` |
-| List the labels Loki knows | same command with `http://loki:3100/loki/api/v1/labels` |
-| Browse and search the events | Grafana → **Explore** → **Loki** |
-| See how a dashboard panel is built | Grafana → panel menu → **Edit** |
+![Grafana Dashboard](images/grafana-mcp-1.png)
+![Grafana Dashboard 2](images/grafana-mcp-2.png)
 
 ---
 
